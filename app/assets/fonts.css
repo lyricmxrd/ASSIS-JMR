@@ -1,0 +1,15 @@
+/* Playfair Display local (variable font: cubre 600 y 800) */
+@font-face {
+  font-family: 'Playfair Display';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(playfair.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Playfair Display';
+  font-style: normal;
+  font-weight: 800;
+  font-display: swap;
+  src: url(playfair.woff2) format('woff2');
+}
