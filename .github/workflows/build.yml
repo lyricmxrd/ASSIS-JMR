@@ -1,0 +1,45 @@
+name: Compilar ASSIS (.exe)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Compilar el instalador .exe
+        run: npx electron-builder --win --publish never
+
+      - name: Guardar el .exe como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: ASSIS-Instalador
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Publicar el .exe en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: assis-v1.0.0
+          name: ASSIS 1.0.0 (Windows)
+          body: |
+            Instalador de ASSIS para Windows.
+            App 100% local (IndexedDB), sin internet, con botones Respaldar / Restaurar contra un repo privado de GitHub.
+          files: dist/*.exe
+          fail_on_unmatched_files: true
