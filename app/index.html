@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASSIS - Asistencia Escolar</title>
+<link rel="icon" type="image/png" href="assets/logo-app.png">
+<script src="assets/jspdf.umd.min.js"></script>
+<script src="assets/jspdf.plugin.autotable.min.js"></script>
+<link rel="stylesheet" href="assets/fonts.css">
+<!-- Datos 100% locales (IndexedDB) — sin Firebase -->
+<script type="module">
+/* ═══════════════════════════════════════════════════════════════════
+   CAPA DE DATOS LOCAL — ASSIS (versión .exe)
+   Reemplaza a Firebase Firestore: TODOS los datos viven en esta
+   computadora, dentro de IndexedDB (assis-local-db).
+   Mantiene exactamente la misma interfaz que usaba la app
+   (doc / collection / setDoc / getDoc / getDocs / updateDoc / deleteDoc)
+   para que el resto del código funcione SIN CAMBIOS y SIN INTERNET.
+   El respaldo a la nube es MANUAL, con los botones Respaldar/Restaurar.
+   ═══════════════════════════════════════════════════════════════════ */
+const IDB_NAME = 'assis-local-db';
+const IDB_STORES = ['secciones', 'planillas'];
+let _idbPromise = null;
+
+function openIDB() {
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const idb = req.result;
+      IDB_STORES.forEach(s => { if (!idb.objectStoreNames.contains(s)) idb.createObjectStore(s); });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return _idbPromise;
+}
+
+function idbRun(store, mode, run) {
+  return openIDB().then(idb => new Promise((resolve, reject) => {
+    const tx = idb.transaction(store, mode);
+    const os = tx.objectStore(store);
+    let result;
+    const rq = run(os);
+    if (rq) {
+      rq.onsuccess = () => { result = rq.result; };
+      rq.onerror = () => reject(rq.error);
+    }
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+const db = { __local: true };
+const collection = (_db, name) => ({ __col: name });
+const doc = (_db, name, id) => ({ __col: name, __id: String(id) });
+
+async function setDoc(ref, data) {
+  const clean = JSON.parse(JSON.stringify(data));
+  await idbRun(ref.__col, 'readwrite', os => os.put(clean, ref.__id));
+}
+async function updateDoc(ref, data) {
+  const cur = (await idbRun(ref.__col, 'readonly', os => os.get(ref.__id))) || {};
+  await setDoc(ref, { ...cur, ...data });
+}
+async function getDoc(ref) {
+  const data = await idbRun(ref.__col, 'readonly', os => os.get(ref.__id));
+  return { exists: () => data !== undefined, data: () => data };
+}
+async function getDocs(colRef) {
+  const idb = await openIDB();
+  const entries = await new Promise((resolve, reject) => {
+    const tx = idb.transaction(colRef.__col, 'readonly');
+    const os = tx.objectStore(colRef.__col);
+    const keysReq = os.getAllKeys();
+    const valsReq = os.getAll();
+    tx.oncomplete = () => resolve(keysReq.result.map((k, i) => ({ id: String(k), data: () => valsReq.result[i] })));
+    tx.onerror = () => reject(tx.error);
+  });
+  return { forEach: (cb) => entries.forEach(cb) };
+}
+async function deleteDoc(ref) {
+  await idbRun(ref.__col, 'readwrite', os => os.delete(ref.__id));
+}
+
+/* ── Ganchos para Respaldar / Restaurar (los usa backup.js) ── */
+window.__assisDumpAll = async () => {
+  const out = {};
+  for (const s of IDB_STORES) {
+    const snap = await getDocs(collection(db, s));
+    const obj = {};
+    snap.forEach(d => { obj[d.id] = d.data(); });
+    out[s] = obj;
+  }
+  return out;
+};
+window.__assisLoadAll = async (data) => {
+  for (const s of IDB_STORES) {
+    const idb = await openIDB();
+    await new Promise((resolve, reject) => {
+      const tx = idb.transaction(s, 'readwrite');
+      tx.objectStore(s).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    const entries = Object.entries(data[s] || {});
+    for (const [id, val] of entries) await setDoc(doc(db, s, id), val);
+  }
+};
+
+
+/* ───────── ESTADO GLOBAL ───────── */
+let currentSectionId = 'p1';
+let sections = [];
+
+/* ───────── LOGIN ───────── */
+window.checkLogin = () => {
+  const pass = document.getElementById('login-pass').value;
+  if (pass === "0") {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app-main-content').style.display = 'flex';
+    loadSections();
+    switchTab('personal');
+  } else {
+    alert("Contraseña incorrecta");
+  }
+};
+
+/* ───────── UTILIDADES ───────── */
+let saveTimer = null;
+function scheduleSave(fn, delay = 800) {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(fn, delay);
+}
+
+function showStatus(msg, ok = true) {
+  const el = document.getElementById('fb-status');
+  el.textContent = msg;
+  el.style.color = ok ? 'var(--green)' : 'var(--red)';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.textContent = '', 3000);
+}
+
+/* ───────── GESTIÓN DE SECCIONES ───────── */
+async function loadSections() {
+  const snap = await getDocs(collection(db, 'secciones'));
+  sections = [];
+  snap.forEach(doc => sections.push({ id: doc.id, ...doc.data() }));
+  renderSidebar();
+}
+
+async function createSection() {
+  document.getElementById('modal-create-input').value = '';
+  document.getElementById('modal-create').classList.add('open');
+  setTimeout(() => document.getElementById('modal-create-input').focus(), 100);
+
+  window._modalCreateConfirm = async () => {
+    const name = document.getElementById('modal-create-input').value.trim();
+    if (!name) return;
+    closeModal('modal-create');
+    const id = 'sec_' + Date.now();
+    await setDoc(doc(db, 'secciones', id), { name });
+    await loadSections();
+    switchTab(id);
+  };
+}
+
+async function editSectionName(id, oldName) {
+  document.getElementById('modal-edit-input').value = oldName;
+  document.getElementById('modal-edit').classList.add('open');
+  setTimeout(() => document.getElementById('modal-edit-input').focus(), 100);
+
+  window._modalEditConfirm = async () => {
+    const newName = document.getElementById('modal-edit-input').value.trim();
+    if (!newName || newName === oldName) { closeModal('modal-edit'); return; }
+    closeModal('modal-edit');
+    try {
+      await updateDoc(doc(db, 'secciones', id), { name: newName });
+      showStatus('✓ Nombre actualizado');
+      await loadSections();
+    } catch(e) { showStatus('✗ Error al actualizar', false); }
+  };
+}
+
+function renderSidebar() {
+  const container = document.getElementById('sections-list');
+  container.innerHTML = '';
+  sections.forEach(sec => {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'nav-item-wrapper' + (currentSectionId === sec.id ? ' active' : '');
+
+    const btn = document.createElement('button');
+    btn.className = 'nav-btn-inner';
+    btn.innerHTML = `<span>📁</span> ${sec.name}`;
+    btn.onclick = () => switchTab(sec.id);
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'edit-sec-btn btn-edit';
+    editBtn.title = 'Editar nombre';
+    editBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+    editBtn.onclick = (e) => {
+      e.stopPropagation();
+      editSectionName(sec.id, sec.name);
+    };
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'edit-sec-btn btn-del';
+    delBtn.title = 'Eliminar sección';
+    delBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
+    delBtn.onclick = (e) => {
+      e.stopPropagation();
+      deleteSection(sec.id, sec.name);
+    };
+
+    wrapper.appendChild(btn);
+    wrapper.appendChild(editBtn);
+    wrapper.appendChild(delBtn);
+    container.appendChild(wrapper);
+  });
+}
+
+async function deleteSection(id, name) {
+  document.getElementById('modal-del-name').textContent = name;
+  document.getElementById('modal-del').classList.add('open');
+
+  window._modalDelConfirm = async () => {
+    closeModal('modal-del');
+    try {
+      await deleteDoc(doc(db, 'secciones', id));
+      await deleteDoc(doc(db, 'planillas', id));
+      showStatus('✓ Sección eliminada');
+      if (currentSectionId === id) switchTab('personal');
+      await loadSections();
+    } catch(e) { showStatus('✗ Error al eliminar', false); }
+  };
+}
+
+window.switchTab = async (id) => {
+  currentSectionId = id;
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('visible'));
+  document.querySelectorAll('.nav-item-wrapper').forEach(b => b.classList.remove('active'));
+  document.getElementById('btn-nav-personal').classList.remove('active');
+
+  if (id === 'personal') {
+    document.getElementById('s-personal').classList.add('visible');
+    document.getElementById('btn-nav-personal').classList.add('active');
+    loadP3();
+  } else {
+    document.getElementById('s-matricular').classList.add('visible');
+    renderSidebar();
+    loadP1(id);
+  }
+};
+
+/* ───────── PLANILLA 1 (MATRICULAR) ───────── */
+async function saveP1() {
+  if (currentSectionId === 'personal') return;
+  try {
+    const data = {
+      anio:  document.getElementById('p1_anio').value,
+      sec:   document.getElementById('p1_sec').value,
+      fecha: document.getElementById('p1_fecha').value,
+      names: [...document.querySelectorAll('[data-p1n]')].map(i => i.value),
+      cells: [...document.querySelectorAll('#t1b .att-inp')].map(i => i.value)
+    };
+    await setDoc(doc(db, 'planillas', currentSectionId), data);
+    showStatus('✓ Planilla guardada');
+  } catch(e) { showStatus('✗ Error al guardar', false); }
+}
+
+async function loadP1(id) {
+  try {
+    const snap = await getDoc(doc(db, 'planillas', id));
+    document.getElementById('p1_anio').value = '';
+    document.getElementById('p1_sec').value = '';
+    document.getElementById('p1_fecha').value = '';
+    document.querySelectorAll('[data-p1n]').forEach(i => i.value = '');
+    document.querySelectorAll('#t1b .att-inp').forEach(i => { i.value = ''; i.dataset.v = ''; });
+
+    if (!snap.exists()) return;
+    const d = snap.data();
+    document.getElementById('p1_anio').value  = d.anio  || '';
+    document.getElementById('p1_sec').value   = d.sec   || '';
+    document.getElementById('p1_fecha').value = d.fecha || '';
+    const names = document.querySelectorAll('[data-p1n]');
+    const cells = document.querySelectorAll('#t1b .att-inp');
+    (d.names || []).forEach((v, i) => { if(names[i]) names[i].value = v; });
+    (d.cells || []).forEach((v, i) => {
+      if(cells[i]) { cells[i].value = v; cells[i].dataset.v = v; }
+    });
+    showStatus('✓ Planilla cargada');
+  } catch(e) { showStatus('✗ Error al cargar', false); }
+}
+
+window._saveP1 = () => scheduleSave(saveP1);
+
+async function clearP1Firebase() {
+  if (confirm("¿Limpiar todos los datos de esta sección?")) {
+    document.querySelectorAll('[data-p1n]').forEach(i => i.value = '');
+    document.querySelectorAll('#t1b .att-inp').forEach(i => { i.value = ''; i.dataset.v = ''; });
+    ['p1_anio','p1_sec','p1_fecha'].forEach(id => document.getElementById(id).value = '');
+    await deleteDoc(doc(db, 'planillas', currentSectionId));
+    showStatus('✓ Limpiado');
+  }
+}
+window._clearP1 = clearP1Firebase;
+
+/* ───────── PLANILLA 3 (PERSONAL) ───────── */
+async function saveP3() {
+  try {
+    const fechas = [...document.querySelectorAll('[data-p3f]')].map(i => i.value);
+    const cells = [];
+    document.querySelectorAll('[data-p3r]').forEach(i => {
+      cells.push({ r: i.dataset.p3r, g: i.dataset.p3g, t: i.dataset.p3t, v: i.value });
+    });
+    const data = {
+      periodo: document.getElementById('p3_periodo').value,
+      inst:    document.getElementById('p3_inst').value,
+      fechas, cells
+    };
+    await setDoc(doc(db, 'planillas', 'personal'), data);
+    showStatus('✓ Personal guardado');
+  } catch(e) { showStatus('✗ Error al guardar', false); }
+}
+
+async function loadP3() {
+  try {
+    const snap = await getDoc(doc(db, 'planillas', 'personal'));
+    if (!snap.exists()) return;
+    const d = snap.data();
+    document.getElementById('p3_periodo').value = d.periodo || '';
+    document.getElementById('p3_inst').value    = d.inst    || '';
+    const fechas = document.querySelectorAll('[data-p3f]');
+    (d.fechas || []).forEach((v, i) => { if(fechas[i]) fechas[i].value = v; });
+    (d.cells  || []).forEach(c => {
+      const el = document.querySelector(`[data-p3r="${c.r}"][data-p3g="${c.g}"][data-p3t="${c.t}"]`);
+      if (el) {
+        el.value = c.v;
+        if (c.t === 'fal' && c.v) { el.readOnly = true; el.classList.add('falt-auto'); }
+      }
+    });
+  } catch(e) {}
+}
+
+window._saveP3 = () => scheduleSave(saveP3);
+
+async function clearP3Firebase() {
+  if (confirm("¿Limpiar todos los datos de esta sección?")) {
+    document.getElementById('p3_periodo').value = '';
+    document.getElementById('p3_inst').value = '';
+    document.querySelectorAll('[data-p3f]').forEach(i => i.value = '');
+    document.querySelectorAll('[data-p3r]').forEach(i => {
+      i.value = '';
+      if (i.dataset.p3t === 'fal') { i.readOnly = true; i.classList.remove('falt-auto'); }
+    });
+    await deleteDoc(doc(db, 'planillas', 'personal'));
+    showStatus('✓ Limpiado');
+  }
+}
+window._clearP3 = clearP3Firebase;
+window._createSection = createSection;
+/* Gancho local: refresca la interfaz tras Restaurar */
+window.__assisReloadUI = async () => { await loadSections(); await switchTab(currentSectionId); };
+</script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #f4f3ef; --surface: #ffffff; --surface2: #f0efe9;
+    --border: #d0cfc8; --text: #1a1a18; --text2: #5a5a55; --text3: #9a9a94;
+    --blue: #A970FF;
+    --weekend: #7116F8;
+    --green: #0F6E56; --red: #A32D2D; --amber: #854F0B;
+    --radius: 10px; --radius-sm: 6px;
+    --brand-color: #C285FF;
+    --sidebar-color: #962fda;
+  }
+  body.dark {
+    --bg: #12101a; --surface: #1e1a2e; --surface2: #252035;
+    --border: #3a3450; --text: #ffffff; --text2: #d0c8f0; --text3: #a090c8;
+    --green: #1db98a; --red: #e05555; --amber: #c98a1a;
+  }
+  body.dark input,
+  body.dark textarea,
+  body.dark select { color: #ffffff; }
+  body.dark .hrow input { color: #1a1a18 !important; }
+  body.dark td,
+  body.dark th { color: #ffffff; }
+  body.dark .plan-title,
+  body.dark .field label,
+  body.dark .num-cell { color: #ffffff; }
+  body.dark .btn-clr { color: #ffffff; background: var(--surface2); }
+  /* Switch Modo Claro/Oscuro */
+  .theme-corner {
+    position: absolute; right: 20px; top: 50%; transform: translateY(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+  }
+  .theme-switch {
+    width: 52px; height: 28px; background: rgba(255,255,255,0.2);
+    border-radius: 14px; border: 2px solid rgba(255,255,255,0.35);
+    cursor: pointer; position: relative; transition: background 0.3s;
+    flex-shrink: 0;
+  }
+  .theme-switch:hover { background: rgba(255,255,255,0.3); }
+  .theme-knob {
+    position: absolute; top: 2px; left: 2px;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: #fff; transition: transform 0.3s cubic-bezier(.34,1.56,.64,1);
+    display: flex; align-items: center; justify-content: center;
+  }
+  body.dark .theme-knob { transform: translateX(24px); background: #2a1a4e; }
+  .theme-icon { font-size: 13px; line-height: 1; user-select: none; }
+  .theme-label { font-size: 9px; color: rgba(255,255,255,0.7); font-weight: 600; letter-spacing: 1px; text-transform: uppercase; }
+  body { font-family: 'Segoe UI',sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  /* Eliminar spinners de inputs numéricos */
+  input[type=number] { -moz-appearance: textfield; }
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; display: none; }
+
+  /* Pantalla de Login */
+  #login-screen {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: linear-gradient(-45deg, #7116F8, #A970FF, #FF0080, #00BFFF);
+    background-size: 400% 400%;
+    animation: gradientBG 15s ease infinite;
+    display: flex; align-items: center; justify-content: center; z-index: 1000;
+  }
+  @keyframes gradientBG {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+  .falling-letters-container {
+    position: absolute;
+    bottom: 40px;
+    left: 0;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    gap: 15px;
+    pointer-events: none;
+    z-index: 1;
+  }
+  .falling-letter {
+    color: rgba(255, 255, 255, 0.8);
+    font-family: 'Playfair Display', serif;
+    font-size: 48px;
+    font-weight: 800;
+    text-transform: uppercase;
+    opacity: 0;
+    transform: translateY(-100vh) rotate(var(--rot));
+    animation: fallAndAlign 3s forwards;
+    animation-delay: var(--delay);
+  }
+  @keyframes fallAndAlign {
+    0% {
+      opacity: 0;
+      transform: translateY(-100vh) rotate(var(--rot));
+    }
+    20% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) rotate(0deg);
+    }
+  }
+  .login-box {
+    position: relative;
+    z-index: 10;
+    background: white; padding: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+    text-align: center; width: 350px;
+  }
+  .login-logo { height: 120px; margin-bottom: 20px; }
+  .login-title { font-family: 'Playfair Display', serif; font-size: 42px; font-weight: 800; color: var(--brand-color); margin-bottom: 30px; }
+  .login-input { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 20px; text-align: center; font-size: 18px; }
+  .login-btn { width: 100%; padding: 12px; background: var(--brand-color); color: white; border: none; border-radius: 10px; font-weight: 700; cursor: pointer; }
+
+  /* App Main */
+  #app-main-content { display: none; min-height: 100vh; flex-direction: column; }
+  .body-row { display: flex; flex-direction: row; flex: 1; min-height: 0; }
+
+  /* Barra Lateral */
+  .sidebar {
+    width: 260px; background-color: var(--sidebar-color); color: white;
+    display: flex; flex-direction: column; padding: 20px 0; flex-shrink: 0;
+    box-shadow: 2px 0 5px rgba(0,0,0,0.1); z-index: 100;
+    position: sticky; top: 0; align-self: flex-start; height: 100vh; overflow-y: auto;
+  }
+  .sidebar-title { padding: 0 20px 20px; font-family: 'Playfair Display', serif; font-size: 18px; border-bottom: 1px solid rgba(255,255,255,0.2); margin-bottom: 20px; }
+  .nav-item-wrapper { display: flex; align-items: center; width: 100%; transition: background 0.2s; }
+  .nav-item-wrapper:hover { background: rgba(255,255,255,0.1); }
+  .nav-item-wrapper.active { background: rgba(255,255,255,0.2); font-weight: 600; }
+  .nav-btn-inner { flex-grow: 1; padding: 12px 10px 12px 20px; background: transparent; border: none; color: white; text-align: left; font-size: 14px; cursor: pointer; display: flex; align-items: center; gap: 10px; }
+  .edit-sec-btn { width: 28px; height: 28px; min-width: 28px; border: none; cursor: pointer; border-radius: 4px; display: flex; align-items: center; justify-content: center; margin-right: 4px; flex-shrink: 0; }
+  .edit-sec-btn.btn-edit { background: #ffffff; }
+  .edit-sec-btn.btn-edit svg { color: #1a1a18; }
+  .edit-sec-btn.btn-del { background: #c0392b; }
+  .edit-sec-btn.btn-del svg { color: #ffffff; }
+  .nav-btn { width: 100%; padding: 12px 20px; background: transparent; border: none; color: white; text-align: left; font-size: 14px; cursor: pointer; display: flex; align-items: center; gap: 10px; }
+  .nav-btn.active { background: rgba(255,255,255,0.2); font-weight: 600; }
+  .btn-create { margin: 10px 20px; padding: 10px; background: white; color: var(--sidebar-color); border-radius: var(--radius-sm); font-weight: 600; text-align: center; cursor: pointer; border: none; }
+
+  /* Barra Superior FIJA */
+  .top-bar {
+    background: linear-gradient(270deg, #7d00d1, #a020f0, #5500aa, #c040ff, #7d00d1);
+    background-size: 300% 300%;
+    animation: topBarGrad 8s ease infinite;
+    padding: 20px 0; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.15); position: sticky; top: 0; z-index: 500; gap: 30px; flex-shrink: 0;
+  }
+  @keyframes topBarGrad {
+    0%   { background-position: 0% 50%; }
+    50%  { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+  .app-logo { height: 100px; width: auto; object-fit: contain; }
+  .text-container { display: flex; flex-direction: column; align-items: flex-start; }
+  .top-bar h1 { color: #ffffff; font-family: 'Playfair Display', serif; font-size: 56px; font-weight: 800; letter-spacing: 4px; line-height: 0.9; margin: 0; }
+  .top-bar .subtitle { color: rgba(255,255,255,0.95); font-size: 16px; letter-spacing: 4px; font-weight: 600; text-transform: uppercase; word-spacing: 12px; margin-top: 5px; width: 340px; height: 22px; overflow: hidden; white-space: nowrap; }
+  .tw-cursor { display: inline-block; width: 2px; height: 1em; background: rgba(255,255,255,0.85); margin-left: 2px; vertical-align: middle; animation: twBlink 0.8s step-end infinite; }
+  @keyframes twBlink { 0%,100%{opacity:1} 50%{opacity:0} }
+  #fb-status { position: absolute; right: 32px; bottom: 15px; font-size: 12px; font-weight: 600; color: white !important; }
+
+  .app-container { flex-grow: 1; display: flex; flex-direction: column; overflow-x: hidden; min-height: 0; }
+  .main { padding: 28px 32px; flex-grow: 1; }
+  .section { display: none; }
+  .section.visible { display: block; }
+  .plan-title { font-size: 20px; font-weight: 700; margin-bottom: 18px; }
+  .hrow { display: flex; gap: 20px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 20px; background: var(--surface); padding: 16px 20px; border-radius: var(--radius); border: 1px solid var(--border); }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11px; font-weight: 600; color: var(--text3); text-transform: uppercase; }
+  .field input { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 7px 11px; font-size: 13px; }
+  .tw { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); margin-bottom: 16px; }
+  table { border-collapse: collapse; font-size: 12px; width: 100%; }
+  thead th { background: var(--surface2); border: 1px solid var(--border); padding: 6px 4px; text-align: center; font-weight: 600; }
+  thead th.wh { background: var(--blue); color: white; }
+  thead th.wknd { background: var(--weekend); color: white; border-color: rgba(0,0,0,0.1); }
+  tbody td { border: 1px solid var(--border); text-align: center; }
+  tbody td.num-cell { background: var(--surface2); font-weight: 600; }
+  tbody td.wknd-cell { background: var(--weekend) !important; }
+  tbody td.wknd-cell input { color: white !important; font-weight: bold; }
+  td input { border: none; outline: none; width: 100%; padding: 6px; background: transparent; text-align: center; }
+  .att-inp { cursor: pointer; font-weight: 600; }
+  .att-inp[data-v="A"] { color: var(--green); }
+  .att-inp[data-v="F"] { color: var(--red); }
+  .att-inp[data-v="J"] { color: var(--amber); }
+  /* ── MODALES ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; z-index: 2000;
+    background: rgba(30, 0, 60, 0.55);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; animation: mFadeIn .18s ease; }
+  @keyframes mFadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .modal-box {
+    background: linear-gradient(135deg, rgba(94,0,189,0.92) 0%, rgba(70,0,145,0.97) 100%);
+    border: 1px solid rgba(255,255,255,0.18);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-radius: 16px;
+    padding: 32px 28px 24px;
+    width: 340px;
+    box-shadow: 0 8px 40px rgba(94,0,189,0.45), 0 2px 8px rgba(0,0,0,0.3);
+    animation: mSlideUp .2s cubic-bezier(.34,1.56,.64,1);
+  }
+  @keyframes mSlideUp { from { transform: translateY(24px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  .modal-icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 14px; }
+  .modal-icon.create { background: rgba(255,255,255,0.15); }
+  .modal-icon.edit   { background: rgba(255,255,255,0.15); }
+  .modal-icon.del    { background: rgba(220,50,50,0.3); }
+  .modal-title { font-family: 'Playfair Display', serif; font-size: 20px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+  .modal-sub { font-size: 13px; color: rgba(255,255,255,0.65); margin-bottom: 20px; }
+  .modal-sub strong { color: rgba(255,255,255,0.9); }
+  .modal-input {
+    width: 100%; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.1);
+    color: #fff; font-size: 14px; margin-bottom: 20px; outline: none;
+  }
+  .modal-input::placeholder { color: rgba(255,255,255,0.4); }
+  .modal-input:focus { border-color: rgba(255,255,255,0.5); background: rgba(255,255,255,0.15); }
+  .modal-btns { display: flex; gap: 10px; justify-content: flex-end; }
+  .modal-btn { padding: 9px 20px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s; }
+  .modal-btn:hover { opacity: 0.85; }
+  .modal-btn.cancel { background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.8); }
+  .modal-btn.confirm { background: #fff; color: #5E00BD; }
+  .modal-btn.danger  { background: #e03030; color: #fff; }
+
+  .btn-pdf { padding: 10px 24px; border-radius: var(--radius-sm); background: var(--blue); color: #fff; border: none; cursor: pointer; }
+  .btn-clr { padding: 10px 24px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); cursor: pointer; }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="falling-letters-container" id="falling-letters"></div>
+  <div class="login-box">
+    <img src="assets/logo-login.png" alt="Logo" class="login-logo">
+    <div class="login-title">Assis</div>
+    <input type="password" id="login-pass" class="login-input" placeholder="Contraseña" onkeypress="if(event.key==='Enter') checkLogin()">
+    <button class="login-btn" onclick="checkLogin()">Entrar</button>
+  </div>
+</div>
+
+<div id="app-main-content">
+  <div class="top-bar">
+    <img src="assets/logo-app.png" alt="Logo" class="app-logo">
+    <div class="text-container">
+      <h1>ASSIS</h1>
+      <div class="subtitle" id="typewriter-text"></div>
+    </div>
+    <div class="theme-corner">
+      <div class="theme-switch" id="theme-switch" onclick="toggleTheme()" title="Cambiar modo">
+        <div class="theme-knob">
+          <span class="theme-icon" id="theme-icon">
+            <!-- sol (modo claro) -->
+            <svg id="icon-sun" xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+              <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+              <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+              <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+            </svg>
+            <!-- luna (modo oscuro) -->
+            <svg id="icon-moon" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#c0a0ff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/>
+            </svg>
+          </span>
+        </div>
+      </div>
+      <span class="theme-label" id="theme-label">CLARO</span>
+    </div>
+    <span id="fb-status"></span>
+  </div>
+
+  <div class="body-row">
+  <aside class="sidebar">
+    <div class="sidebar-title">Menú Principal</div>
+    <button id="btn-nav-personal" class="nav-btn" onclick="switchTab('personal')"><span>👥</span> Asistencia Personal</button>
+    <div style="margin-top: 20px; padding: 0 20px; font-size: 11px; text-transform: uppercase; opacity: 0.7;">Secciones / Aulas</div>
+    <button class="btn-create" onclick="_createSection()">+ Crear Sección</button>
+    <div id="sections-list"></div>
+    <div style="margin-top: 24px; padding: 0 20px;">
+      <div style="font-size: 11px; text-transform: uppercase; opacity: 0.7; margin-bottom: 4px;">Respaldo en la nube</div>
+      <button class="btn-create" style="margin: 6px 0 0 0; width: 100%;" onclick="assisRespaldar()">☁️ Respaldar</button>
+      <button class="btn-create" style="margin: 8px 0 0 0; width: 100%;" onclick="assisRestaurar()">⬇️ Restaurar</button>
+      <button class="btn-create" style="margin: 8px 0 0 0; width: 100%; background: rgba(255,255,255,0.15); color: #fff;" onclick="assisConfigurar()">⚙️ Configurar respaldo</button>
+    </div>
+  </aside>
+
+  <div class="app-container">
+    <div class="main">
+      <div id="s-matricular" class="section">
+        <div class="plan-title">Asistencia Estudiantes</div>
+        <div class="hrow">
+          <div class="field"><label>Año</label><input id="p1_anio" style="width:80px" oninput="_saveP1()"></div>
+          <div class="field"><label>Sección</label><input id="p1_sec" style="width:100px" oninput="_saveP1()"></div>
+          <div class="field"><label>Fecha</label><input id="p1_fecha" style="width:130px" oninput="_saveP1()"></div>
+        </div>
+        <div class="tw">
+          <table id="t1">
+            <thead>
+              <tr>
+                <th rowspan="2" style="width:32px">N°</th>
+                <th rowspan="2" style="min-width:200px;text-align:left;padding-left:10px">Nombre y Apellido</th>
+                <th class="wh" colspan="7">Semana 1</th>
+                <th class="wh" colspan="7">Semana 2</th>
+                <th class="wh" colspan="7">Semana 3</th>
+                <th class="wh" colspan="7">Semana 4</th>
+              </tr>
+              <tr id="t1dh"></tr>
+            </thead>
+            <tbody id="t1b"></tbody>
+          </table>
+        </div>
+        <div class="brow">
+          <button class="btn-save" onclick="_saveP1()">💾 Guardar</button>
+          <button class="btn-pdf" onclick="exportP1()">⬇ PDF</button>
+          <button class="btn-clr" onclick="_clearP1()">Limpiar</button>
+        </div>
+      </div>
+
+      <div id="s-personal" class="section">
+        <div class="plan-title">Asistencia de Personal General</div>
+        <div class="hrow">
+          <div class="field"><label>Mes / Período</label><input id="p3_periodo" style="width:160px" oninput="_saveP3()"></div>
+          <div class="field"><label>Institución</label><input id="p3_inst" style="width:220px" oninput="_saveP3()"></div>
+        </div>
+        <div class="tw">
+          <table id="t3">
+            <thead>
+              <tr>
+                <th rowspan="2" style="min-width:95px">Fecha</th>
+                <th class="wh" colspan="3">Docentes</th>
+                <th class="wh" colspan="3">Obreros</th>
+                <th class="wh" colspan="3">Administradores</th>
+                <th class="wh" colspan="3">Vigilantes</th>
+                <th class="wh" colspan="3">Cocineros</th>
+              </tr>
+              <tr>
+                <th>Total</th><th>Asistentes</th><th>Faltantes</th>
+                <th>Total</th><th>Asistentes</th><th>Faltantes</th>
+                <th>Total</th><th>Asistentes</th><th>Faltantes</th>
+                <th>Total</th><th>Asistentes</th><th>Faltantes</th>
+                <th>Total</th><th>Asistentes</th><th>Faltantes</th>
+              </tr>
+            </thead>
+            <tbody id="t3b"></tbody>
+          </table>
+        </div>
+        <div class="brow">
+          <button class="btn-save" onclick="_saveP3()">💾 Guardar</button>
+          <button class="btn-pdf" onclick="exportP3()">⬇ PDF</button>
+          <button class="btn-clr" onclick="_clearP3()">Limpiar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  </div>
+</div>
+
+<script>
+const DAYS=['L','M','M','J','V','S','D'];
+const ROWS1=40, ROWS3=25;
+const CYCLE=['A','F','J',''];
+
+(function initTables(){
+  // Animación de letras
+  const container = document.getElementById('falling-letters');
+  const name = "JUAN MIGUEL ROO";
+  name.split('').forEach((char, i) => {
+    const span = document.createElement('span');
+    span.className = 'falling-letter';
+    span.textContent = char === ' ' ? '\u00A0' : char;
+    span.style.setProperty('--delay', `${i * 0.1}s`);
+    span.style.setProperty('--rot', `${Math.random() * 360 - 180}deg`);
+    container.appendChild(span);
+  });
+
+  const hdr=document.getElementById('t1dh');
+  for(let w=0;w<4;w++) DAYS.forEach(d=>{
+    const th=document.createElement('th'); th.textContent=d; th.style.width='26px';
+    if(d==='S'||d==='D') th.className='wknd';
+    hdr.appendChild(th);
+  });
+  const body=document.getElementById('t1b');
+  for(let r=0;r<ROWS1;r++){
+    const tr=document.createElement('tr');
+    const nc=document.createElement('td'); nc.className='num-cell'; nc.textContent=String(r+1).padStart(2,'0'); tr.appendChild(nc);
+    const nt=document.createElement('td');
+    const ni=document.createElement('input'); ni.type='text'; ni.className='txt-inp'; ni.dataset.p1n=r;
+    ni.oninput = () => _saveP1();
+    nt.appendChild(ni); tr.appendChild(nt);
+    for(let w=0;w<4;w++) DAYS.forEach((d,di)=>{
+      const td=document.createElement('td');
+      if(d==='S'||d==='D') td.className='wknd-cell';
+      const inp=document.createElement('input'); inp.type='text'; inp.className='att-inp'; inp.readOnly=true;
+      inp.onclick=e=>{
+        const i=e.target,idx=CYCLE.indexOf(i.value);
+        i.value=CYCLE[(idx+1)%CYCLE.length]; i.dataset.v=i.value;
+        _saveP1();
+      };
+      td.appendChild(inp); tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  }
+
+  // Planilla 3: ahora 5 grupos (0=Docentes, 1=Obreros, 2=Administradores, 3=Vigilantes, 4=Cocineros)
+  const b3=document.getElementById('t3b');
+  for(let r=0;r<ROWS3;r++){
+    const tr=document.createElement('tr');
+    const ft=document.createElement('td');
+    const fi=document.createElement('input'); fi.type='text'; fi.dataset.p3f=r; fi.oninput=()=>_saveP3();
+    ft.appendChild(fi); tr.appendChild(ft);
+    for(let g=0;g<5;g++){
+      [0,1,2].forEach(t=>{
+        const td=document.createElement('td');
+        const i=document.createElement('input'); i.type='number';
+        i.dataset.p3r=r; i.dataset.p3g=g; i.dataset.p3t=['tot','asi','fal'][t];
+        if(t===2) { i.readOnly=true; i.className='falt-auto'; }
+        i.oninput=()=>{
+          if(t<2){
+            const tot=parseInt(document.querySelector(`[data-p3r="${r}"][data-p3g="${g}"][data-p3t="tot"]`).value)||0;
+            const asi=parseInt(document.querySelector(`[data-p3r="${r}"][data-p3g="${g}"][data-p3t="asi"]`).value)||0;
+            document.querySelector(`[data-p3r="${r}"][data-p3g="${g}"][data-p3t="fal"]`).value = tot-asi;
+          }
+          _saveP3();
+        };
+        td.appendChild(i); tr.appendChild(td);
+      });
+    }
+    b3.appendChild(tr);
+  }
+})();
+
+function exportP1(){
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+  const anio=document.getElementById('p1_anio').value||'';
+  const sec=document.getElementById('p1_sec').value||'';
+  const fecha=document.getElementById('p1_fecha').value||'';
+  doc.setFontSize(14);
+  doc.text(`Asistencia Estudiantes - Año: ${anio} Sección: ${sec} Fecha: ${fecha}`, 14, 14);
+  const names = [...document.querySelectorAll('[data-p1n]')].map(i => i.value);
+  const cells = [...document.querySelectorAll('#t1b .att-inp')].map(i => i.value);
+  const body = [];
+  for(let r=0; r<ROWS1; r++){
+    const row = [String(r+1).padStart(2,'0'), names[r] || ''];
+    for(let c=0; c<28; c++){ row.push(cells[r*28+c] || ''); }
+    body.push(row);
+  }
+  const daysRow = ['', '', ...Array(4).fill(DAYS).flat()];
+  const head = [
+    ['N°', 'Nombre y Apellido', 'Semana 1', '', '', '', '', '', '', 'Semana 2', '', '', '', '', '', '', 'Semana 3', '', '', '', '', '', '', 'Semana 4', '', '', '', '', '', ''],
+    daysRow
+  ];
+  doc.autoTable({
+    head: head,
+    body: body,
+    startY: 20,
+    styles: { fontSize: 5.5, textColor: [0, 0, 0], fontStyle: 'bold', halign: 'center' },
+    columnStyles: { 1: { halign: 'left' } },
+    headStyles: { fillColor: [169, 112, 255] },
+    didParseCell: function(data) {
+      if (data.section === 'head' && data.row.index === 1) {
+        const day = data.cell.text[0];
+        if (day === 'S' || day === 'D') data.cell.styles.fillColor = [113, 22, 248];
+      }
+    }
+  });
+  doc.save('asistencia_estudiantes.pdf');
+}
+
+function exportP3(){
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});
+  const periodo=document.getElementById('p3_periodo').value||'';
+  const inst=document.getElementById('p3_inst').value||'';
+  doc.setFontSize(14);
+  doc.text(`Asistencia Personal - Período: ${periodo} Institución: ${inst}`, 14, 14);
+  const fechas = [...document.querySelectorAll('[data-p3f]')].map(i => i.value);
+  const body = [];
+  for(let r=0; r<ROWS3; r++){
+    const row = [fechas[r] || ''];
+    for(let g=0; g<5; g++){
+      ['tot','asi','fal'].forEach(t => {
+        const val = document.querySelector(`[data-p3r="${r}"][data-p3g="${g}"][data-p3t="${t}"]`).value;
+        row.push(val || '');
+      });
+    }
+    body.push(row);
+  }
+  doc.autoTable({
+    head: [[
+      'Fecha',
+      'Doc Tot', 'Doc Asi', 'Doc Fal',
+      'Obr Tot', 'Obr Asi', 'Obr Fal',
+      'Adm Tot', 'Adm Asi', 'Adm Fal',
+      'Vig Tot', 'Vig Asi', 'Vig Fal',
+      'Coc Tot', 'Coc Asi', 'Coc Fal'
+    ]],
+    body: body,
+    startY: 20,
+    styles: { fontSize: 9, textColor: [0, 0, 0], fontStyle: 'bold' },
+    headStyles: { fillColor: [169, 112, 255] }
+  });
+  doc.save('asistencia_personal.pdf');
+}
+</script>
+<!-- MODAL CREAR SECCIÓN -->
+<div id="modal-create" class="modal-overlay" onclick="if(event.target===this)closeModal('modal-create')">
+  <div class="modal-box">
+    <div class="modal-icon create">
+      <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+    </div>
+    <div class="modal-title">Nueva Sección</div>
+    <div class="modal-sub">Ingresa el nombre del aula o sección</div>
+    <input id="modal-create-input" class="modal-input" type="text" placeholder="Ej: Sección A" onkeydown="if(event.key==='Enter')_modalCreateConfirm()">
+    <div class="modal-btns">
+      <button class="modal-btn cancel" onclick="closeModal('modal-create')">Cancelar</button>
+      <button class="modal-btn confirm" onclick="_modalCreateConfirm()">Crear</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL EDITAR SECCIÓN -->
+<div id="modal-edit" class="modal-overlay" onclick="if(event.target===this)closeModal('modal-edit')">
+  <div class="modal-box">
+    <div class="modal-icon edit">
+      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+    </div>
+    <div class="modal-title">Editar Sección</div>
+    <div class="modal-sub">Modifica el nombre de esta sección</div>
+    <input id="modal-edit-input" class="modal-input" type="text" placeholder="Nuevo nombre" onkeydown="if(event.key==='Enter')_modalEditConfirm()">
+    <div class="modal-btns">
+      <button class="modal-btn cancel" onclick="closeModal('modal-edit')">Cancelar</button>
+      <button class="modal-btn confirm" onclick="_modalEditConfirm()">Guardar</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL ELIMINAR SECCIÓN -->
+<div id="modal-del" class="modal-overlay" onclick="if(event.target===this)closeModal('modal-del')">
+  <div class="modal-box">
+    <div class="modal-icon del">
+      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+    </div>
+    <div class="modal-title">Eliminar Sección</div>
+    <div class="modal-sub">¿Eliminar permanentemente <strong id="modal-del-name"></strong>? Se borrarán todos sus datos.</div>
+    <div class="modal-btns">
+      <button class="modal-btn cancel" onclick="closeModal('modal-del')">Cancelar</button>
+      <button class="modal-btn danger" onclick="_modalDelConfirm()">Eliminar</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function closeModal(id) {
+  document.getElementById(id).classList.remove('open');
+}
+</script>
+<script>
+(function typewriter() {
+  const el = document.getElementById('typewriter-text');
+  const phrases = ['JUAN MIGUEL ROO', 'SISTEMA ADMINISTRATIVO'];
+  const TYPE_SPEED  = 90;   // ms por letra al escribir
+  const ERASE_SPEED = 55;   // ms por letra al borrar
+  const PAUSE_AFTER = 2200; // ms de pausa tras escribir completo
+  const PAUSE_EMPTY = 400;  // ms de pausa tras borrar todo
+
+  let phraseIdx = 0, charIdx = 0, erasing = false;
+
+  function tick() {
+    const current = phrases[phraseIdx];
+    if (!erasing) {
+      charIdx++;
+      el.textContent = current.slice(0, charIdx);
+      if (charIdx === current.length) {
+        erasing = true;
+        setTimeout(tick, PAUSE_AFTER);
+        return;
+      }
+      setTimeout(tick, TYPE_SPEED);
+    } else {
+      charIdx--;
+      el.textContent = current.slice(0, charIdx);
+      if (charIdx === 0) {
+        erasing = false;
+        phraseIdx = (phraseIdx + 1) % phrases.length;
+        setTimeout(tick, PAUSE_EMPTY);
+        return;
+      }
+      setTimeout(tick, ERASE_SPEED);
+    }
+  }
+
+  // Arrancar después de que la app cargue visualmente
+  setTimeout(tick, 600);
+})();
+</script>
+<script>
+function toggleTheme() {
+  const isDark = document.body.classList.toggle('dark');
+  document.getElementById('icon-sun').style.display  = isDark ? 'none'   : 'inline';
+  document.getElementById('icon-moon').style.display = isDark ? 'inline' : 'none';
+  document.getElementById('theme-label').textContent = isDark ? 'OSCURO' : 'CLARO';
+  try { localStorage.setItem('assis-theme', isDark ? 'dark' : 'light'); } catch(e) {}
+}
+// Restaurar preferencia guardada
+(function() {
+  try {
+    if (localStorage.getItem('assis-theme') === 'dark') {
+      document.body.classList.add('dark');
+      document.getElementById('icon-sun').style.display  = 'none';
+      document.getElementById('icon-moon').style.display = 'inline';
+      document.getElementById('theme-label').textContent = 'OSCURO';
+    }
+  } catch(e) {}
+})();
+</script>
+<!-- MODAL CONFIGURAR RESPALDO -->
+<div id="modal-backup" class="modal-overlay" onclick="if(event.target===this)closeModal('modal-backup')">
+  <div class="modal-box">
+    <div class="modal-icon create">
+      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>
+    </div>
+    <div class="modal-title">Respaldo en la nube</div>
+    <div class="modal-sub">Pega tu token de GitHub (se guarda solo en esta computadora). La copia se sube a un repositorio <strong>privado</strong> de tu cuenta cuando pulses «Respaldar».</div>
+    <input id="gh-token-input" class="modal-input" type="password" placeholder="Token de GitHub (ghp_...)" autocomplete="off">
+    <input id="gh-repo-input" class="modal-input" type="text" placeholder="Nombre del repositorio" autocomplete="off">
+    <div class="modal-btns">
+      <button class="modal-btn cancel" onclick="closeModal('modal-backup')">Cancelar</button>
+      <button class="modal-btn confirm" onclick="assisGuardarConfig()">Guardar</button>
+    </div>
+  </div>
+</div>
+<script src="backup.js"></script>
+</body>
+</html>
