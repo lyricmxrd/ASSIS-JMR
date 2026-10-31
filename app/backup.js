@@ -71,6 +71,22 @@
     document.getElementById('gh-repo-input').value = getRepo();
     document.getElementById('modal-backup').classList.add('open');
   };
+  window.assisPegarToken = async () => {
+    try {
+      let txt = '';
+      if (window.assisPortapapeles) txt = await window.assisPortapapeles.pegar();
+      if (!txt && navigator.clipboard && navigator.clipboard.readText) txt = await navigator.clipboard.readText();
+      txt = (txt || '').trim();
+      if (txt) {
+        document.getElementById('gh-token-input').value = txt;
+        bStatus('✓ Token pegado');
+      } else {
+        alert('El portapapeles está vacío. Primero copia tu token de GitHub y luego pulsa «Pegar».');
+      }
+    } catch (e) {
+      alert('No se pudo pegar automáticamente. Haz clic en el campo del token y pulsa Ctrl+V.');
+    }
+  };
   window.assisGuardarConfig = () => {
     const token = document.getElementById('gh-token-input').value.trim();
     const repo = document.getElementById('gh-repo-input').value.trim() || DEFAULT_REPO;
