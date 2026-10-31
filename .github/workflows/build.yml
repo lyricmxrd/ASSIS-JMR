@@ -30,16 +30,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ASSIS-Instalador
-          path: dist/*.exe
+          path: |
+            dist/*.exe
+            dist/*.yml
+            dist/*.blockmap
           if-no-files-found: error
 
       - name: Publicar el .exe en Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: assis-v1.0.1
-          name: ASSIS 1.0.1 (Windows)
+          tag_name: assis-v1.1.0
+          name: ASSIS 1.1.0 (Windows)
           body: |
             Instalador de ASSIS para Windows.
-            App 100% local (IndexedDB), sin internet, con botones Respaldar / Restaurar contra un repo privado de GitHub.
-          files: dist/*.exe
+            App 100% local (IndexedDB), con botones Respaldar / Restaurar contra GitHub
+            y actualización automática desde la propia app.
+          files: |
+            dist/*.exe
+            dist/*.yml
+            dist/*.blockmap
           fail_on_unmatched_files: true
