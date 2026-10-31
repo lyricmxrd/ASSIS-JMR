@@ -18,13 +18,25 @@
       "createStartMenuShortcut": true,
       "oneClick": false,
       "perMachine": false,
-      "shortcutName": "ASSIS"
+      "shortcutName": "ASSIS",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "installerHeader": "build/installerHeader.bmp"
     },
     "productName": "ASSIS",
     "win": {
       "artifactName": "ASSIS-Instalador-${version}.exe",
-      "target": "nsis"
-    }
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "lyricmxrd",
+        "repo": "ASSIS-JMR"
+      }
+    ]
   },
   "description": "ASSIS - Asistencia Escolar (Juan Miguel Roo). App de escritorio 100% local con respaldo manual en GitHub.",
   "devDependencies": {
@@ -38,5 +50,8 @@
     "dist": "electron-builder --win",
     "start": "electron ."
   },
-  "version": "1.0.1"
+  "version": "1.1.0",
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  }
 }
