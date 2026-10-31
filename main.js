@@ -121,7 +121,7 @@ function createWindow() {
     height: 860,
     minWidth: 1024,
     minHeight: 680,
-    title: 'ASSIS - Asistencia Escolar',
+    title: `ASSIS - Asistencia Escolar (v${app.getVersion()})`,
     icon: path.join(__dirname, 'app', 'assets', 'logo-app.png'),
     webPreferences: {
       contextIsolation: true,
@@ -150,6 +150,22 @@ function createWindow() {
     shell.openExternal(url);
     return { action: 'deny' };
   });
+  // Antes de cerrar, la app guarda lo que esté pendiente de escribir.
+  // Se intercepta el cierre, se le pide al contenido que guarde y se
+  // espera su confirmación (con un máximo de 700 ms por seguridad).
+  let cierreListo = false;
+  win.on('close', (e) => {
+    if (cierreListo) return;
+    e.preventDefault();
+    const seguro = setTimeout(() => { cierreListo = true; win.close(); }, 700);
+    ipcMain.once('assis:guardado-confirmado', () => {
+      clearTimeout(seguro);
+      cierreListo = true;
+      win.close();
+    });
+    win.webContents.send('assis:guardar-antes-de-cerrar');
+  });
+  win.webContents.on('did-finish-load', () => win.setTitle(`ASSIS - Asistencia Escolar (v${app.getVersion()})`));
   win.loadFile(path.join(__dirname, 'app', 'index.html'));
 }
 
