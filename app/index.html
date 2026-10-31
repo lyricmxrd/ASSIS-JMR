@@ -988,7 +988,10 @@ function toggleTheme() {
     </div>
     <div class="modal-title">Respaldo en la nube</div>
     <div class="modal-sub">Pega tu token de GitHub (se guarda solo en esta computadora). La copia se sube a un repositorio <strong>privado</strong> de tu cuenta cuando pulses «Respaldar».</div>
-    <input id="gh-token-input" class="modal-input" type="password" placeholder="Token de GitHub (ghp_...)" autocomplete="off">
+    <div style="display:flex; gap:8px; margin-bottom:20px;">
+      <input id="gh-token-input" class="modal-input" type="password" placeholder="Token de GitHub (ghp_...)" autocomplete="off" style="margin-bottom:0; flex:1;">
+      <button class="modal-btn confirm" type="button" onclick="assisPegarToken()">Pegar</button>
+    </div>
     <input id="gh-repo-input" class="modal-input" type="text" placeholder="Nombre del repositorio" autocomplete="off">
     <div class="modal-btns">
       <button class="modal-btn cancel" onclick="closeModal('modal-backup')">Cancelar</button>
