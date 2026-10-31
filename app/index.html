@@ -129,9 +129,13 @@ window.checkLogin = () => {
 
 /* ───────── UTILIDADES ───────── */
 let saveTimer = null;
-function scheduleSave(fn, delay = 800) {
+let __lastSaveAt = 0, __pendingFn = null;
+function scheduleSave(fn) {
+  __pendingFn = fn;
+  const wait = 250 - (Date.now() - __lastSaveAt);
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(fn, delay);
+  if (wait <= 0) { saveTimer = null; __lastSaveAt = Date.now(); const f = __pendingFn; __pendingFn = null; f(); }
+  else saveTimer = setTimeout(() => { saveTimer = null; __lastSaveAt = Date.now(); const f = __pendingFn; __pendingFn = null; if (f) f(); }, wait);
 }
 
 function showStatus(msg, ok = true) {
@@ -390,6 +394,12 @@ document.querySelectorAll('#t1b .att-inp').forEach(inp => {
     else if (e.key.length === 1) { e.preventDefault(); }
   });
 });
+
+// Al salir de cualquier campo, lo escrito queda guardado al instante
+document.addEventListener('focusout', (e) => { if (e.target && e.target.tagName === 'INPUT') __flushPendingSave(); });
+
+// Si la app se va a cerrar, primero guarda lo pendiente y luego avisa que puede cerrar
+if (window.assisCierre) window.assisCierre.alGuardar(async () => { await __flushPendingSave(); window.assisCierre.confirmar(); });
 
 // Botones «Guardar»: guardan al momento, no con retardo
 document.querySelectorAll('.btn-save').forEach(b => b.addEventListener('click', () => { window.__assisFlushSave(); }));
