@@ -39,8 +39,8 @@ jobs:
       - name: Publicar el .exe en Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: assis-v1.1.0
-          name: ASSIS 1.1.0 (Windows)
+          tag_name: assis-v1.1.1
+          name: ASSIS 1.1.1 (Windows)
           body: |
             Instalador de ASSIS para Windows.
             App 100% local (IndexedDB), con botones Respaldar / Restaurar contra GitHub
