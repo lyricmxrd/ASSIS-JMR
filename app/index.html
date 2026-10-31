@@ -237,6 +237,7 @@ async function deleteSection(id, name) {
 }
 
 window.switchTab = async (id) => {
+  await __flushPendingSave();
   currentSectionId = id;
   document.querySelectorAll('.section').forEach(s => s.classList.remove('visible'));
   document.querySelectorAll('.nav-item-wrapper').forEach(b => b.classList.remove('active'));
@@ -362,6 +363,36 @@ window._clearP3 = clearP3Firebase;
 window._createSection = createSection;
 /* Gancho local: refresca la interfaz tras Restaurar */
 window.__assisReloadUI = async () => { await loadSections(); await switchTab(currentSectionId); };
+
+/* ── Corrección local: registro confiable en las planillas ──
+   - Lo pendiente se guarda AL INSTANTE (sin esperar el retardo de 800 ms).
+   - Al cambiar de sección primero se guarda lo de la actual: nada se pierde.
+   - Las celdas de asistencia también aceptan teclear A, F o J (además del clic). */
+async function __flushPendingSave() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer); saveTimer = null;
+  try {
+    if (currentSectionId === 'personal') await saveP3();
+    else if (currentSectionId && currentSectionId !== 'p1') await saveP1();
+  } catch (e) {}
+}
+window.__assisFlushSave = __flushPendingSave;
+
+// Clic en celda de asistencia = guardar al momento (su onclick ya cambió la letra)
+document.querySelectorAll('#t1b .att-inp').forEach(inp => {
+  inp.addEventListener('click', () => { clearTimeout(saveTimer); saveTimer = null; saveP1(); });
+  // También se puede teclear la letra directamente
+  inp.addEventListener('keydown', (e) => {
+    const k = (e.key || '').toUpperCase();
+    if (['A', 'F', 'J'].includes(k)) { inp.value = k; inp.dataset.v = k; clearTimeout(saveTimer); saveTimer = null; saveP1(); e.preventDefault(); }
+    else if (e.key === 'Backspace' || e.key === 'Delete') { inp.value = ''; inp.dataset.v = ''; clearTimeout(saveTimer); saveTimer = null; saveP1(); e.preventDefault(); }
+    else if (e.key === 'Tab' || e.key.startsWith('Arrow')) { /* navegación normal */ }
+    else if (e.key.length === 1) { e.preventDefault(); }
+  });
+});
+
+// Botones «Guardar»: guardan al momento, no con retardo
+document.querySelectorAll('.btn-save').forEach(b => b.addEventListener('click', () => { window.__assisFlushSave(); }));
 </script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
