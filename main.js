@@ -1,11 +1,79 @@
 // ASSIS — proceso principal de Electron
 // App 100% local: los datos viven en IndexedDB dentro del perfil de la app
 // (carpeta de datos del usuario de Windows), sin necesitar internet.
-const { app, BrowserWindow, shell, Menu, ipcMain, clipboard } = require('electron');
+// Al abrirla busca actualizaciones en GitHub (si hay internet) y avisa.
+const { app, BrowserWindow, shell, Menu, ipcMain, clipboard, dialog } = require('electron');
 const path = require('path');
+const { autoUpdater } = require('electron-updater');
 
-// Menú con roles de edición: SIN esto, en Windows los atajos Ctrl+C / Ctrl+V /
-// Ctrl+X no llegan a los campos de la app ni aparece el menú de clic derecho.
+/* ───────── ACTUALIZACIONES ───────── */
+let chequeoManual = false;
+
+function initUpdater() {
+  if (!app.isPackaged) return;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('update-available', (info) => {
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Actualización disponible',
+      message: `Hay una versión nueva de ASSIS (${info.version}). Se está descargando en segundo plano; te aviso cuando esté lista para instalar.`,
+      buttons: ['Entendido']
+    });
+  });
+  autoUpdater.on('update-not-available', () => {
+    if (!chequeoManual) return;
+    chequeoManual = false;
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'ASSIS está actualizado',
+      message: `Ya tienes la última versión (${app.getVersion()}).`,
+      buttons: ['Aceptar']
+    });
+  });
+  autoUpdater.on('update-downloaded', (info) => {
+    dialog.showMessageBox({
+      type: 'question',
+      title: 'Actualización lista',
+      message: `La versión ${info.version} de ASSIS ya se descargó. ¿Quieres reiniciar la app ahora para instalarla? Tus datos no se tocan.`,
+      buttons: ['Reiniciar e instalar', 'Más tarde']
+    }).then(({ response }) => {
+      if (response === 0) autoUpdater.quitAndInstall();
+    });
+  });
+  autoUpdater.on('error', () => {
+    if (!chequeoManual) return;
+    chequeoManual = false;
+    dialog.showMessageBox({
+      type: 'warning',
+      title: 'Sin conexión',
+      message: 'No se pudo buscar actualizaciones. Revisa tu conexión a internet e inténtalo de nuevo.',
+      buttons: ['Aceptar']
+    });
+  });
+
+  // Revisión automática al abrir (silenciosa si no hay nada nuevo)
+  autoUpdater.checkForUpdates().catch(() => {});
+}
+
+function buscarActualizacionesManual() {
+  if (!app.isPackaged) return;
+  chequeoManual = true;
+  autoUpdater.checkForUpdates().catch(() => {
+    chequeoManual = false;
+    dialog.showMessageBox({
+      type: 'warning',
+      title: 'Sin conexión',
+      message: 'No se pudo buscar actualizaciones. Revisa tu conexión a internet.',
+      buttons: ['Aceptar']
+    });
+  });
+}
+
+/* ───────── MENÚ ─────────
+   Con roles de edición: SIN esto, en Windows los atajos Ctrl+C / Ctrl+V /
+   Ctrl+X no llegan a los campos de la app ni aparece el menú de clic derecho. */
 function buildMenu() {
   const template = [
     {
@@ -23,6 +91,21 @@ function buildMenu() {
         { role: 'paste', label: 'Pegar' },
         { type: 'separator' },
         { role: 'selectAll', label: 'Seleccionar todo' }
+      ]
+    },
+    {
+      label: 'Ayuda',
+      submenu: [
+        { label: 'Buscar actualizaciones…', click: () => buscarActualizacionesManual() },
+        {
+          label: 'Acerca de ASSIS',
+          click: () => dialog.showMessageBox({
+            type: 'info',
+            title: 'Acerca de ASSIS',
+            message: `ASSIS — Asistencia Escolar\nVersión ${app.getVersion()}\nLos datos se guardan en esta computadora; el respaldo en la nube es manual (botones Respaldar / Restaurar).`,
+            buttons: ['Aceptar']
+          })
+        }
       ]
     }
   ];
@@ -73,6 +156,7 @@ function createWindow() {
 app.whenReady().then(() => {
   buildMenu();
   createWindow();
+  initUpdater();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
